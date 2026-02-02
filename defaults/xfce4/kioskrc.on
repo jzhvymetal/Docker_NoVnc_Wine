@@ -1,0 +1,19 @@
+# XFCE kiosk mode - ENABLED
+
+[xfce4-panel]
+CustomizePanel=NONE
+
+[xfdesktop]
+UserMenu=NONE
+CustomizeBackdrop=NONE
+CustomizeDesktopMenu=NONE
+CustomizeWindowlist=NONE
+CustomizeDesktopIcons=NONE
+
+[xfce4-session]
+CustomizeSplash=NONE
+CustomizeChooser=NONE
+CustomizeLogout=NONE
+CustomizeCompatibility=NONE
+CustomizeSecurity=NONE
+Shutdown=NONE

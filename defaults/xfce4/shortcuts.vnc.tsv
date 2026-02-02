@@ -1,0 +1,25 @@
+/commands/custom/<Alt><Super>s	string	orca
+/commands/custom/<Alt>F1	string	xfce4-popup-applicationsmenu
+/commands/custom/<Alt>F2	string	xfce4-appfinder --collapsed
+/commands/custom/<Alt>F2/startup-notify	bool	true
+/commands/custom/<Alt>F3	string	xfce4-appfinder
+/commands/custom/<Alt>F3/startup-notify	bool	true
+/commands/custom/<Alt>Print	string	xfce4-screenshooter -w
+/commands/custom/<Primary><Alt>Delete	string	xfce4-session-logout
+/commands/custom/<Primary><Alt>Escape	string	xkill
+/commands/custom/<Primary><Alt>f	string	thunar
+/commands/custom/<Primary><Alt>l	string	xflock4
+/commands/custom/<Primary><Alt>t	string	exo-open --launch TerminalEmulator
+/commands/custom/<Primary><Shift>Escape	string	xfce4-taskmanager
+/commands/custom/<Primary>Escape	string	xfdesktop --menu
+/commands/custom/<Shift>Print	string	xfce4-screenshooter -r
+/commands/custom/<Super>e	string	thunar
+/commands/custom/<Super>p	string	xfce4-display-settings --minimal
+/commands/custom/<Super>r	string	xfce4-appfinder -c
+/commands/custom/<Super>r/startup-notify	bool	true
+/commands/custom/HomePage	string	exo-open --launch WebBrowser
+/commands/custom/Print	string	xfce4-screenshooter
+/commands/custom/XF86Display	string	xfce4-display-settings --minimal
+/commands/custom/XF86Mail	string	exo-open --launch MailReader
+/commands/custom/XF86WWW	string	exo-open --launch WebBrowser
+/commands/custom/override	bool	true

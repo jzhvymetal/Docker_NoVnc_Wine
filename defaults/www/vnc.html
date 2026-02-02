@@ -1,0 +1,546 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>noVNC</title>
+
+  <style>
+    html, body {
+      margin: 0 !important;
+      padding: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      overflow: hidden !important;
+      background: #000 !important;
+    }
+
+    /* Keep iframe mounted, but hidden until the desktop mode is ready */
+    iframe#f {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      border: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      outline: none !important;
+      background: #000 !important;
+
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 220ms ease;
+    }
+
+    iframe#f.ready {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    /* Overlay while stack is getting ready */
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      color: #fff;
+      font: 600 22px/1.2 Arial, Helvetica, sans-serif;
+      z-index: 99999;
+      user-select: none;
+      pointer-events: none; /* do not block clicks */
+    }
+
+    #overlay.hide {
+      display: none;
+    }
+
+    #overlay .box {
+      background: rgba(0,0,0,0.55);
+      padding: 14px 18px;
+      border-radius: 6px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.45);
+      display: inline-flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .dots { display:inline-block; width: 3ch; }
+    .dots span {
+      display:inline-block;
+      width: 1ch;
+      text-align:center;
+      opacity: 0.2;
+      animation: dot 1.2s infinite;
+    }
+    .dots span:nth-child(1) { animation-delay: 0s; }
+    .dots span:nth-child(2) { animation-delay: 0.2s; }
+    .dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes dot {
+      0%, 60%, 100% { opacity: 0.2; }
+      30% { opacity: 1; }
+    }
+  </style>
+</head>
+
+<body>
+  <div id="overlay">
+    <div class="box">
+      <span id="overlayText">Setting up desktop</span>
+      <span class="dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+    </div>
+  </div>
+
+  <iframe id="f" allow="clipboard-read; clipboard-write"></iframe>
+
+  <script>
+    (function () {
+      // ============================================================
+      // VNC wrapper v3
+      // - Never reveal until /show returns OK and VNC is connected
+      // - Detect server restarts via boot_id and re-assert mode
+      // - Leader election prevents multiple tabs fighting
+      // ============================================================
+
+      const overlay = document.getElementById("overlay");
+      const overlayText = document.getElementById("overlayText");
+      const frame = document.getElementById("f");
+
+      const API_SHOW = "/api/toolbar/show";
+      const API_MODE = "/api/toolbar/mode";
+      const WANT_MODE = "off"; // "off" means normal desktop
+
+      const FORCE_AFTER_MS = 8000;
+      const MODE_SETTLE_MS = 1200;
+      const CONNECT_POLL_MS = 900;
+      const KEEPALIVE_MS = 15000;
+      const STALE_MODE_MS = 45000;
+
+      const TAB_ID = (self.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : (String(Date.now()) + "-" + Math.random().toString(16).slice(2));
+
+      // Leader coordination
+      const CH_NAME = "toolbar_mode_coord_v2";
+      const bc = ("BroadcastChannel" in window) ? new BroadcastChannel(CH_NAME) : null;
+
+      let killed = false;
+
+      let leaderId = null;
+      let lastClaimTs = 0;
+      let lastLeaderBeatMs = 0;
+      let beatTimer = null;
+
+      // Gate state
+      let revealed = false;
+      let connected = false;
+      let modeOk = false;
+
+      // Server identity
+      let serverBootId = null;
+
+      // Last time we knew mode was OK (used for stale fallback)
+      let lastModeOkMs = 0;
+
+      function nowMs() { return Date.now(); }
+      function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+      function fetchWithTimeout(url, timeoutMs) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs);
+        return fetch(url, { cache: "no-store", signal: ctrl.signal })
+          .finally(() => clearTimeout(t));
+      }
+
+      function showOverlay(msg) {
+        overlayText.textContent = msg || "Setting up desktop";
+        overlay.classList.remove("hide");
+      }
+
+      function hideOverlay() {
+        overlay.classList.add("hide");
+      }
+
+      function setHidden(hidden) {
+        if (hidden) frame.classList.remove("ready");
+        else frame.classList.add("ready");
+      }
+
+      function isLeaderAndVisible() {
+        if (document.visibilityState !== "visible") return false;
+        if (!leaderId) return true;
+        return leaderId === TAB_ID;
+      }
+
+      function sendBeat() {
+        if (!bc) return;
+        if (leaderId !== TAB_ID) return;
+        bc.postMessage({ type: "beat", id: TAB_ID, t: nowMs() });
+      }
+
+      function becomeLeader() {
+        leaderId = TAB_ID;
+        const ts = nowMs();
+        lastClaimTs = ts;
+        lastLeaderBeatMs = ts;
+        if (bc) bc.postMessage({ type: "claim", id: TAB_ID, ts });
+        if (beatTimer) clearInterval(beatTimer);
+        beatTimer = setInterval(sendBeat, 900);
+
+        // If we are leader, re-assert show mode.
+        kickShowApply({ hardGate: !revealed, forceFirst: false, reason: "became-leader" });
+      }
+
+      function resignLeader() {
+        if (leaderId !== TAB_ID) return;
+        leaderId = null;
+        if (beatTimer) clearInterval(beatTimer);
+        beatTimer = null;
+      }
+
+      if (bc) {
+        bc.onmessage = (ev) => {
+          const m = (ev && ev.data) ? ev.data : {};
+          if (m.type === "claim" && m.id && typeof m.ts === "number") {
+            if (m.ts >= lastClaimTs) {
+              leaderId = m.id;
+              lastClaimTs = m.ts;
+              if (m.id !== TAB_ID) {
+                // We are not leader anymore.
+                if (beatTimer) clearInterval(beatTimer);
+                beatTimer = null;
+              }
+            }
+          }
+          if (m.type === "beat" && m.id && typeof m.t === "number") {
+            if (m.id === leaderId) lastLeaderBeatMs = nowMs();
+          }
+        };
+      }
+
+      // Leader watchdog
+      setInterval(() => {
+        if (killed) return;
+
+        if (document.visibilityState !== "visible") {
+          resignLeader();
+          return;
+        }
+
+        const staleLeader = (!leaderId) || ((nowMs() - lastLeaderBeatMs) > 2500);
+        if (staleLeader) becomeLeader();
+      }, 700);
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          // If we become visible, try to lead and ensure mode.
+          becomeLeader();
+        } else {
+          resignLeader();
+        }
+      });
+
+      window.addEventListener("focus", () => becomeLeader());
+      window.addEventListener("online", () => becomeLeader());
+
+      // -----------------------------
+      // noVNC URL
+      // -----------------------------
+      const novncUrl = new URL("/novnc/vnc.html", location.origin);
+      const params = novncUrl.searchParams;
+      params.set("path", "/websockify");
+      params.set("autoconnect", "1");
+      params.set("reconnect", "1");
+      params.set("reconnect_delay", "2000");
+      params.set("resize", "remote");
+
+      // forward query params from wrapper page to noVNC
+      const incoming = new URLSearchParams(location.search);
+      for (const [k, v] of incoming.entries()) {
+        if (!params.has(k)) params.set(k, v);
+      }
+
+      frame.src = novncUrl.toString();
+
+      // Initial gate
+      setHidden(true);
+      showOverlay("Setting up desktop");
+
+      // -----------------------------
+      // noVNC connected detection (connect dialog hidden means connected)
+      // -----------------------------
+      function getNoVNCDocument() {
+        try {
+          return frame.contentDocument || (frame.contentWindow && frame.contentWindow.document) || null;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function isNoVNCConnected() {
+        const doc = getNoVNCDocument();
+        if (!doc) return null;
+
+        const dlg = doc.getElementById("noVNC_connect_dlg");
+        if (!dlg) return null;
+
+        if (dlg.classList && dlg.classList.contains("noVNC_hidden")) return true;
+
+        try {
+          const cs = doc.defaultView && doc.defaultView.getComputedStyle ? doc.defaultView.getComputedStyle(dlg) : null;
+          if (!cs) return null;
+          const shown = (cs.display !== "none") && (cs.visibility !== "hidden");
+          return !shown;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      // -----------------------------
+      // Mode helpers
+      // -----------------------------
+      async function callMode() {
+        try {
+          const r = await fetchWithTimeout(API_MODE + "?ts=" + nowMs(), 2000);
+          if (!r.ok) return null;
+          return await r.json();
+        } catch (e) {
+          return null;
+        }
+      }
+
+      async function callShow(force) {
+        try {
+          const r = await fetchWithTimeout(API_SHOW + "?force=" + (force ? 1 : 0) + "&ts=" + nowMs(), 3500);
+          let payload = null;
+          try { payload = await r.json(); } catch (e) {}
+          return { status: r.status, payload: payload };
+        } catch (e) {
+          return { status: 0, payload: null };
+        }
+      }
+
+      function bootChanged(payload) {
+        if (!payload || !payload.boot_id) return false;
+        if (!serverBootId) { serverBootId = payload.boot_id; return false; }
+        if (serverBootId !== payload.boot_id) {
+          serverBootId = payload.boot_id;
+          return true;
+        }
+        return false;
+      }
+
+      function wantShowOk(payload) {
+        if (!payload) return false;
+        if (payload.current_mode !== WANT_MODE) return false;
+        if (payload.x_ready === false) return false;
+        return true;
+      }
+
+      function maybeReveal() {
+        if (killed) return;
+        if (modeOk && connected) {
+          revealed = true;
+          hideOverlay();
+          setHidden(false);
+          return;
+        }
+
+        // Keep hidden, but show the most relevant overlay message.
+        setHidden(true);
+        if (!connected) showOverlay("Connecting to desktop");
+        else showOverlay("Setting up desktop");
+      }
+
+      // -----------------------------
+      // Apply show mode loop
+      // -----------------------------
+      let applyToken = 0;
+      let applying = false;
+
+      async function applyShowLoop(opts) {
+        if (killed) return false;
+        if (!isLeaderAndVisible()) return false;
+
+        applying = true;
+        const token = ++applyToken;
+
+        const forceFirst = !!(opts && opts.forceFirst);
+        const silent = !!(opts && opts.silent);
+
+        const start = nowMs();
+        let forced = false;
+        let delay = 300;
+
+        while (!killed && token === applyToken) {
+          if (!isLeaderAndVisible()) { await sleep(250); continue; }
+
+          const elapsed = nowMs() - start;
+          const doForce = (!forced && (forceFirst || elapsed > FORCE_AFTER_MS));
+          if (doForce) forced = true;
+
+          if (!silent || !revealed) {
+            if (!revealed) showOverlay(doForce ? "Forcing desktop mode" : "Setting up desktop");
+          }
+
+          const res = await callShow(doForce);
+          const p = res.payload;
+
+          if (bootChanged(p)) {
+            // Server restarted. Hard gate again.
+            modeOk = false;
+            revealed = false;
+            setHidden(true);
+            showOverlay("Setting up desktop");
+          }
+
+          if (res.status === 200 && p && p.ok && wantShowOk(p)) {
+            modeOk = true;
+            lastModeOkMs = nowMs();
+            if (MODE_SETTLE_MS > 0) await sleep(MODE_SETTLE_MS);
+            applying = false;
+            maybeReveal();
+            return true;
+          }
+
+          await sleep(delay);
+          delay = Math.min(Math.floor(delay * 1.25), 2000);
+        }
+
+        applying = false;
+        return false;
+      }
+
+      function kickShowApply(opts) {
+        if (killed) return;
+        if (!isLeaderAndVisible()) return;
+
+        const hardGate = !!(opts && opts.hardGate);
+        if (hardGate) {
+          modeOk = false;
+          revealed = false;
+          setHidden(true);
+          showOverlay("Setting up desktop");
+        }
+
+        // Cancel any existing apply loop by incrementing token.
+        applyToken++;
+        applying = false;
+
+        applyShowLoop(opts || {});
+      }
+
+      // -----------------------------
+      // Connection monitor
+      // -----------------------------
+      let lastConn = null;
+
+      async function onReconnect() {
+        // Reconnected. Ensure mode is correct.
+        // If server rebooted, force once.
+        const p = await callMode();
+        const rebooted = bootChanged(p);
+
+        if (rebooted) {
+          kickShowApply({ hardGate: true, forceFirst: true, reason: "server-reboot" });
+          return;
+        }
+
+        if (p && p.current_mode && p.current_mode !== WANT_MODE) {
+          kickShowApply({ hardGate: false, forceFirst: false, reason: "mode-wrong" });
+          return;
+        }
+
+        if (p && p.x_ready === false) {
+          kickShowApply({ hardGate: !revealed, forceFirst: false, reason: "x-not-ready" });
+          return;
+        }
+
+        // If we have not confirmed mode recently, do a soft resync.
+        if (!lastModeOkMs || (nowMs() - lastModeOkMs) > STALE_MODE_MS) {
+          kickShowApply({ hardGate: false, forceFirst: false, silent: true, reason: "stale" });
+        }
+
+        maybeReveal();
+      }
+
+      setInterval(async () => {
+        if (killed) return;
+
+        const c = isNoVNCConnected();
+        if (c === null) return;
+
+        if (lastConn === null) {
+          lastConn = c;
+          connected = (c === true);
+          maybeReveal();
+          return;
+        }
+
+        if (c !== lastConn) {
+          lastConn = c;
+          connected = (c === true);
+
+          if (!connected) {
+            revealed = false;
+            modeOk = false; // require re-assert after reconnect
+            setHidden(true);
+            showOverlay("Reconnecting");
+          } else {
+            await onReconnect();
+          }
+        }
+      }, CONNECT_POLL_MS);
+
+      // -----------------------------
+      // Keepalive
+      // -----------------------------
+      setInterval(async () => {
+        if (killed) return;
+        if (!isLeaderAndVisible()) return;
+
+        const c = isNoVNCConnected();
+        if (c !== true) return;
+
+        const p = await callMode();
+        if (p) {
+          const rebooted = bootChanged(p);
+          if (rebooted) {
+            kickShowApply({ hardGate: true, forceFirst: true, reason: "server-reboot" });
+            return;
+          }
+
+          // Mode drift
+          if (p.current_mode && p.current_mode !== WANT_MODE) {
+            kickShowApply({ hardGate: false, forceFirst: false, reason: "mode-drift" });
+            return;
+          }
+
+          if (p.x_ready === false) {
+            kickShowApply({ hardGate: !revealed, forceFirst: false, reason: "x-not-ready" });
+            return;
+          }
+
+          lastModeOkMs = nowMs();
+          return;
+        }
+
+        // No /mode. Fall back to occasional silent /show probe.
+        if (lastModeOkMs && (nowMs() - lastModeOkMs) < STALE_MODE_MS) return;
+        kickShowApply({ hardGate: false, forceFirst: false, silent: true, reason: "no-mode" });
+      }, KEEPALIVE_MS);
+
+      // Start: try to lead immediately and apply show mode.
+      if (document.visibilityState === "visible") becomeLeader();
+      kickShowApply({ hardGate: true, forceFirst: true, reason: "startup" });
+
+      window.addEventListener("pagehide", () => {
+        killed = true;
+        try { if (bc) bc.close(); } catch (e) {}
+        try { if (beatTimer) clearInterval(beatTimer); } catch (e) {}
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,419 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>noVNC Kiosk</title>
+
+  <style>
+    html, body {
+      margin: 0 !important;
+      padding: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      overflow: hidden !important;
+      background: #000 !important;
+    }
+
+    /* Hard gate: when not ready, iframe is not displayed at all.
+       This prevents stale framebuffer flashes during reconnect. */
+    body:not(.ready) iframe#f {
+      display: none !important;
+    }
+
+    body.ready iframe#f {
+      display: block !important;
+    }
+
+    iframe#f {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      border: 0 !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      outline: none !important;
+      background: #000 !important;
+    }
+
+    /* Overlay visibility is tied to .ready so JS cannot accidentally hide it early */
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.92);
+      color: #fff;
+      font: 600 22px/1.2 Arial, Helvetica, sans-serif;
+      z-index: 99999;
+      user-select: none;
+      pointer-events: none;
+    }
+
+    body.ready #overlay { display: none; }
+
+    #overlay .box {
+      background: rgba(0,0,0,0.55);
+      padding: 14px 18px;
+      border-radius: 6px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.45);
+      display: inline-flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .dots { display: inline-block; width: 3ch; }
+    .dots span {
+      display: inline-block;
+      width: 1ch;
+      text-align: center;
+      opacity: 0.2;
+      animation: dot 1.2s infinite;
+    }
+    .dots span:nth-child(1) { animation-delay: 0s; }
+    .dots span:nth-child(2) { animation-delay: 0.2s; }
+    .dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes dot {
+      0%, 60%, 100% { opacity: 0.2; }
+      30% { opacity: 1; }
+    }
+  </style>
+</head>
+
+<body>
+  <div id="overlay">
+    <div class="box">
+      <span id="overlayText">Setting up Desktop</span>
+      <span class="dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+    </div>
+  </div>
+
+  <iframe id="f" allow="clipboard-read; clipboard-write"></iframe>
+
+  <script>
+    (function () {
+      const overlayText = document.getElementById("overlayText");
+      const frame = document.getElementById("f");
+
+      // Always show the same user-facing message
+      const OVERLAY_MSG = "Setting up Desktop";
+      overlayText.textContent = OVERLAY_MSG;
+
+      const API_KIOSK = "/api/toolbar/kiosk";
+      const API_MODE  = "/api/toolbar/mode";
+
+      // During container restarts these will error temporarily.
+      const MODE_TIMEOUT_MS  = 1500;
+      const KIOSK_TIMEOUT_MS = 20000;
+
+      const FORCE_AFTER_MS   = 8000;
+      const MODE_SETTLE_MS   = 1200;
+
+      // Fast resync loop and websocket gating
+      const FAST_TICK_MS     = 250;
+
+      // noVNC URL
+      const novncSrc =
+        "/novnc/vnc.html" +
+        "?path=/websockify" +
+        "&autoconnect=1" +
+        "&reconnect=1" +
+        "&reconnect_delay=1500" +
+        "&resize=scale";
+
+      frame.src = novncSrc;
+
+      let killed = false;
+
+      // Gate state: only reveal when kiosk confirmed AND VNC connected
+      let kioskOk = false;
+      let vncOk   = false;
+
+      // Track server identity. Any change forces kiosk re-apply.
+      let bootId = null;
+      let needKiosk = true;
+
+      // Apply loop control
+      let applying = false;
+      let applyToken = 0;
+
+      function nowMs(){ return Date.now(); }
+      function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+      function setOverlay(_msg) {
+        overlayText.textContent = OVERLAY_MSG;
+      }
+
+      function gate(_reason) {
+        kioskOk = false;
+        vncOk = false;
+        needKiosk = true;
+        document.body.classList.remove("ready");
+        setOverlay(OVERLAY_MSG);
+        applyToken++;
+        applying = false;
+      }
+
+      function maybeReveal() {
+        if (killed) return;
+        if (kioskOk && vncOk && !needKiosk) {
+          document.body.classList.add("ready");
+          return;
+        }
+        document.body.classList.remove("ready");
+      }
+
+      // Start gated always
+      gate(OVERLAY_MSG);
+
+      function fetchWithTimeout(url, timeoutMs) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => { try { ctrl.abort(); } catch(e) {} }, timeoutMs);
+        return fetch(url, { cache: "no-store", signal: ctrl.signal })
+          .finally(() => clearTimeout(t));
+      }
+
+      async function callMode() {
+        try {
+          const r = await fetchWithTimeout(API_MODE + "?ts=" + nowMs(), MODE_TIMEOUT_MS);
+          if (!r.ok) return null;
+          return await r.json();
+        } catch(e) {
+          return null;
+        }
+      }
+
+      async function callKiosk(force) {
+        try {
+          const r = await fetchWithTimeout(
+            API_KIOSK + "?force=" + (force ? 1 : 0) + "&ts=" + nowMs(),
+            KIOSK_TIMEOUT_MS
+          );
+          let payload = null;
+          try { payload = await r.json(); } catch(e) {}
+          return { status: r.status, payload };
+        } catch(e) {
+          return { status: 0, payload: null };
+        }
+      }
+
+      function wantKioskOk(p) {
+        if (!p) return false;
+        if (p.ok !== true) return false;
+        if (p.current_mode !== "on") return false;
+        if (p.x_ready === false) return false;
+        return true;
+      }
+
+      function getNoVNCDocument() {
+        try {
+          return frame.contentDocument || (frame.contentWindow && frame.contentWindow.document) || null;
+        } catch(e) {
+          return null;
+        }
+      }
+
+      function connectDialogHidden(doc) {
+        const dlg = doc && doc.getElementById("noVNC_connect_dlg");
+        if (!dlg) return null;
+
+        if (dlg.classList && dlg.classList.contains("noVNC_hidden")) return true;
+
+        try {
+          const cs = doc.defaultView && doc.defaultView.getComputedStyle ? doc.defaultView.getComputedStyle(dlg) : null;
+          if (!cs) return null;
+          const shown = (cs.display !== "none") && (cs.visibility !== "hidden");
+          return !shown;
+        } catch(e) {
+          return null;
+        }
+      }
+
+      function patchNoVNC(doc) {
+        if (!doc) return;
+        const bar = doc.getElementById("noVNC_control_bar");
+        if (bar) bar.style.display = "none";
+        const st = doc.getElementById("noVNC_status");
+        if (st) st.style.display = "none";
+        const btn = doc.getElementById("noVNC_connect_button");
+        if (btn) btn.textContent = "Reconnect";
+      }
+
+      // Hook WebSocket inside iframe to gate immediately on errors/close.
+      function hookIframeWebSocket() {
+        const cw = frame.contentWindow;
+        if (!cw) return;
+        if (cw.__kiosk_ws_hooked) return;
+        if (!cw.WebSocket) return;
+
+        const Orig = cw.WebSocket;
+
+        function WrappedWebSocket(url, protocols) {
+          const ws = (protocols !== undefined) ? new Orig(url, protocols) : new Orig(url);
+
+          try {
+            const u = String(url || "");
+            if (u.indexOf("websockify") !== -1) {
+              ws.addEventListener("error", () => {
+                gate(OVERLAY_MSG);
+                maybeReveal();
+              });
+              ws.addEventListener("close", () => {
+                gate(OVERLAY_MSG);
+                maybeReveal();
+              });
+            }
+          } catch(e) {}
+
+          return ws;
+        }
+
+        WrappedWebSocket.prototype = Orig.prototype;
+        WrappedWebSocket.CONNECTING = Orig.CONNECTING;
+        WrappedWebSocket.OPEN = Orig.OPEN;
+        WrappedWebSocket.CLOSING = Orig.CLOSING;
+        WrappedWebSocket.CLOSED = Orig.CLOSED;
+
+        cw.WebSocket = WrappedWebSocket;
+        cw.__kiosk_ws_hooked = true;
+      }
+
+      async function ensureKioskApplied() {
+        if (killed) return false;
+        if (applying) return false;
+        if (!needKiosk) return true;
+
+        applying = true;
+        const token = ++applyToken;
+
+        const start = nowMs();
+        let forced = false;
+        let delay = 400;
+
+        while (!killed && token === applyToken) {
+          // If /mode is unavailable, keep gating and wait.
+          const m = await callMode();
+          if (!m) {
+            gate(OVERLAY_MSG);
+            maybeReveal();
+            await sleep(800);
+            continue;
+          }
+
+          // Detect container restart: always re-apply kiosk
+          if (m.boot_id) {
+            if (!bootId) bootId = m.boot_id;
+            else if (bootId !== m.boot_id) {
+              bootId = m.boot_id;
+              needKiosk = true;
+              kioskOk = false;
+            }
+          }
+
+          const elapsed = nowMs() - start;
+          const doForce = (!forced && elapsed > FORCE_AFTER_MS);
+          if (doForce) forced = true;
+
+          setOverlay(OVERLAY_MSG);
+
+          const res = await callKiosk(doForce);
+          const p = res.payload;
+
+          if (res.status === 200 && wantKioskOk(p)) {
+            kioskOk = true;
+            needKiosk = false;
+            if (MODE_SETTLE_MS > 0) await sleep(MODE_SETTLE_MS);
+            applying = false;
+            return true;
+          }
+
+          // Any fetch failure: treat as offline and keep gated.
+          if (res.status === 0) {
+            gate(OVERLAY_MSG);
+            maybeReveal();
+            await sleep(800);
+            continue;
+          }
+
+          await sleep(delay);
+          delay = Math.min(Math.floor(delay * 1.25), 2200);
+        }
+
+        applying = false;
+        return false;
+      }
+
+      // Fast loop:
+      // - patch/hook iframe
+      // - if /mode fails, gate immediately (ERR_EMPTY_RESPONSE / CONNECTION_REFUSED)
+      // - if VNC not connected, gate immediately
+      // - if connected, keep gated until kiosk is confirmed
+      setInterval(async () => {
+        if (killed) return;
+
+        const doc = getNoVNCDocument();
+        if (doc) {
+          patchNoVNC(doc);
+          hookIframeWebSocket();
+        }
+
+        // VNC state from connect dialog. If not connected, gate now.
+        const hidden = connectDialogHidden(doc);
+        if (hidden === false) {
+          gate(OVERLAY_MSG);
+          maybeReveal();
+          return;
+        }
+
+        // If dialog is not readable yet, stay gated.
+        if (hidden === null) {
+          gate(OVERLAY_MSG);
+          maybeReveal();
+          return;
+        }
+
+        // VNC is connected. Still do NOT reveal until kiosk is confirmed.
+        vncOk = true;
+
+        const m = await callMode();
+        if (!m) {
+          gate(OVERLAY_MSG);
+          maybeReveal();
+          return;
+        }
+
+        // Boot id change forces kiosk re-apply
+        if (m.boot_id) {
+          if (!bootId) bootId = m.boot_id;
+          else if (bootId !== m.boot_id) {
+            bootId = m.boot_id;
+            needKiosk = true;
+            kioskOk = false;
+          }
+        }
+
+        // If server reports kiosk is already on, accept it; otherwise force apply.
+        if (m.current_mode === "on" && m.x_ready !== false) {
+          kioskOk = true;
+        } else {
+          kioskOk = false;
+          needKiosk = true;
+        }
+
+        // Ensure kiosk is applied (may take time). We remain gated during apply.
+        if (needKiosk || !kioskOk) {
+          setOverlay(OVERLAY_MSG);
+          document.body.classList.remove("ready");
+          await ensureKioskApplied();
+        }
+
+        maybeReveal();
+      }, FAST_TICK_MS);
+
+      window.addEventListener("pagehide", () => { killed = true; });
+    })();
+  </script>
+</body>
+</html>
